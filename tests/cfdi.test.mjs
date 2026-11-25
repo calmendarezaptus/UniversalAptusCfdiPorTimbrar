@@ -64,3 +64,28 @@ test('presentación', () => {
   assert.equal(lib.coincide('avolar 796', 'INV-000796', 'Avolar'), true)
   assert.equal(lib.formatFecha('2026-11-25T09:57:00'), '25/11/2026')
 })
+
+test('fase 2: opciones de moneda y TC, archivos y cancelable', async () => {
+  assert.equal(lib.opcionesQuery({ moneda: 'mxn', tc_fuente: 'manual', tipo_cambio: ' 19.5 ' }), 'moneda=mxn&tc_fuente=manual&tipo_cambio=19.5')
+  assert.equal(lib.opcionesQuery({ tc_fuente: 'books', tipo_cambio: '19' }), 'tc_fuente=books')
+  assert.equal(lib.opcionesQuery({ moneda: 'mxn', tc_fuente: 'banxico' }, { conMoneda: false }), 'tc_fuente=banxico')
+  assert.equal(lib.validarTcManual({ tc_fuente: 'manual', tipo_cambio: '' }), 'Escribe el tipo de cambio.')
+  assert.equal(lib.validarTcManual({ tc_fuente: 'manual', tipo_cambio: '19.1234567' }), 'Tipo de cambio inválido: mayor que 0 y hasta 6 decimales.')
+  assert.equal(lib.validarTcManual({ tc_fuente: 'banxico' }), null)
+  assert.equal(lib.borradorPath('9', { moneda: 'mxn' }), 'cfdi/preparar/9/borrador?moneda=mxn')
+  assert.equal(lib.archivoPath(3, 'acuse_xml'), 'cfdi/3/acuse?formato=xml')
+  assert.equal(lib.archivoPath(3, 'pdf_original'), 'cfdi/3/pdf?original=1')
+  assert.equal(lib.nombreArchivo({ serie: 'PRB', folio: '1', id: 3, pdf: { leyenda: 'en_proceso' } }, 'pdf'), 'PRB-1_EN_CANCELACION.pdf')
+  assert.equal(lib.nombreArchivo({ serie: 'PRB', folio: '1', id: 3 }, 'acuse_xml'), 'PRB-1-acuse-cancelacion.xml')
+  const original = globalThis.fetch
+  try {
+    let req
+    globalThis.fetch = async (u, o) => { req = [u, o?.body]; return new Response(JSON.stringify({ cfdi_id: 9, estado: 'timbrando', puede: false, bloqueantes: [] }), { status: 200 }) }
+    await lib.timbrarFactura('1', '2', { moneda: 'mxn', tc_fuente: 'manual', tipo_cambio: '22' }, true)
+    assert.equal(req[1], '{"invoice_id":"2","confirmar":true,"moneda":"mxn","tc_fuente":"manual","tipo_cambio":"22","confirmar_tipo_cambio":true}')
+    await lib.timbrarComplemento('1', '5', { moneda: 'mxn', tc_fuente: 'banxico' })
+    assert.equal(req[1], '{"payment_id":"5","confirmar":true,"tc_fuente":"banxico"}')
+    await lib.getCancelable('1', 3, '01', 'no-uuid')
+    assert.equal(req[0], '/api/1/cfdi/3/cancelable?motivo=01')
+  } finally { globalThis.fetch = original }
+})

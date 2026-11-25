@@ -24,6 +24,27 @@ export interface Receptor {
   rfc: string; nombre: string; regimen_fiscal: string; cp: string; uso_cfdi: string; tipo: string; residencia_fiscal?: string | null; num_reg_id_trib?: string | null
   origen?: Record<string, string>
 }
+// ── Moneda y tipo de cambio (fase 2) ──
+export type MonedaCfdi = 'factura' | 'mxn'
+export type FuenteTc = 'books' | 'banxico' | 'manual'
+export interface OpcionesMoneda { moneda?: MonedaCfdi; tc_fuente?: FuenteTc; tipo_cambio?: string }
+export interface TipoCambioInfo {
+  valor: number | null; fuente: FuenteTc; moneda: string; en_cfdi?: boolean; books?: number | null; fecha_pago?: string
+  banxico?: { tipo_cambio: number; fecha_fix: string; rango_aceptado?: { maximo: number; maximo_sat?: number } } | null
+  banxico_error?: string | null; desviacion_vs_fix_pct?: number | null; requiere_confirmacion?: boolean
+}
+export interface Cancelacion {
+  resultado: 'en_proceso' | 'sin_aceptacion' | 'aceptada' | 'plazo_vencido' | 'rechazada' | null; texto?: string; estado_sat?: string; mensaje_sat?: string
+  motivo?: string; motivo_descripcion?: string; sustituto?: string | null; fecha_solicitud?: string | null; fecha_resultado?: string | null
+  puede_volver_a_solicitar?: boolean; fuente_estatus?: string
+  seguimiento?: { activo: boolean; proxima_consulta?: string | null; consultas?: number; ultima_consulta?: string | null; terminado?: { fin: string; motivo: string } | null; api?: { activo: boolean; motivo?: string } } | null
+  anteriores?: Cancelacion[]
+}
+export interface Cancelable {
+  cfdi_id: number; puede: boolean; bloqueantes: string[]; avisos: string[]
+  complementos_vigentes: { cfdi_id: number; uuid: string; serie: string; folio: string; estado: Estado; payment_id: string }[]
+}
+
 export interface Preparado {
   invoice_id?: string; invoice_number?: string; payment_id?: string; status_books?: string; fecha_books?: string; cliente_nombre?: string; prebill_id?: number | null
   momento?: string; metodo_pago?: string; forma_pago?: string; moneda: string; tipo_cambio?: number | null; receptor?: Receptor
@@ -31,10 +52,13 @@ export interface Preparado {
   totales?: { books?: Record<string, number>; cfdi?: Record<string, number> }
   documentos?: DocumentoPago[]; monto?: number
   idempotency_key?: string; cfdi_existentes?: Cfdi[]; puede_timbrar: boolean; bloqueantes: string[]; avisos: string[]
+  moneda_factura?: string; moneda_cfdi?: string; conversion?: string | null; requiere_confirmar_tipo_cambio?: boolean
+  opciones?: { moneda?: MonedaCfdi; tc_fuente?: FuenteTc; tipo_cambio?: number | null }; tipo_cambio_info?: TipoCambioInfo | null; tipo_cambio_p?: number | null
 }
 export interface DocumentoPago {
   invoice_id: string; invoice_number: string; cfdi_id?: number | null; uuid?: string | null; num_parcialidad?: number
   saldo_anterior?: number; importe_pagado?: number; saldo_insoluto?: number; monto_books?: number; aplicado?: number
+  moneda_dr?: string; equivalencia?: number
 }
 export interface Cfdi {
   id: number; tipo: 'I' | 'E' | 'P'; origen: 'aptus' | 'interno'; estado: Estado; trabajo_en_curso?: unknown
@@ -43,8 +67,12 @@ export interface Cfdi {
   metodo_pago?: string | null; forma_pago?: string | null; fecha?: string | null; fecha_timbrado?: string | null; status_sat?: string | null
   motivo_cancelacion?: string | null; sustituto?: string | null; cancelacion_solicitada_en?: string | null; ultima_consulta?: string | null
   emisor?: string | null; prueba?: boolean; receptor_rfc?: string | null; monto_excluido?: number | null; impuestos?: { tasa: number; base: number; importe: number }[] | null
-  error?: string | null; intentos?: number; pdf_pendiente?: boolean; archivos?: { xml: boolean; pdf: boolean; acuse: boolean }
+  error?: string | null; intentos?: number; pdf_pendiente?: boolean; archivos?: { xml: boolean; pdf: boolean; acuse: boolean; pdf_original?: boolean; acuse_xml?: boolean }
   documentos?: DocumentoPago[]; notas?: string | null; creado_en?: string; actualizado_en?: string
+  cancelacion?: Cancelacion | null
+  pdf?: { leyenda: 'en_proceso' | 'cancelado' | null; leyenda_esperada?: string | null; disponible?: boolean; original_disponible?: boolean; pendiente?: boolean }
+  moneda_factura?: string | null; total_factura?: number | null; conversion?: string | null; tipo_cambio_fuente?: FuenteTc | null
+  tipo_cambio_books?: number | null; tipo_cambio_fix?: number | null; tipo_cambio_fix_fecha?: string | null; tipo_cambio_confirmado?: boolean; advertencias?: string[] | null
 }
 export interface Pago {
   payment_id: string; payment_number: string; fecha: string; monto: number; moneda: string; modo_pago_books?: string; forma_pago?: string
@@ -87,8 +115,33 @@ const esTrabajo = (d: unknown) => isObj(d) && Number.isInteger(d.cfdi_id)
 
 export const getProveedor = (org: string) => read<Proveedor>(org, 'cfdi/proveedor', isObj)
 export const getPendientes = (org: string, todas: boolean) => read<Pendientes>(org, `cfdi/pendientes${todas ? '?todas=1' : ''}`, d => isObj(d) && Array.isArray(d.facturas))
-export const prepararFactura = (org: string, invoiceId: string) => read<Preparado>(org, `cfdi/preparar/${encodeURIComponent(invoiceId)}`, d => isObj(d) && Array.isArray(d.bloqueantes))
-export const prepararComplemento = (org: string, paymentId: string) => read<Preparado>(org, `cfdi/complemento/preparar/${encodeURIComponent(paymentId)}`, d => isObj(d) && Array.isArray(d.bloqueantes))
+// Solo lo elegido; el tipo de cambio solo con la fuente manual.
+export function opcionesQuery(o: OpcionesMoneda = {}, { conMoneda = true } = {}): string {
+  const q = new URLSearchParams()
+  if (conMoneda && o.moneda) q.set('moneda', o.moneda)
+  if (o.tc_fuente) q.set('tc_fuente', o.tc_fuente)
+  if (o.tc_fuente === 'manual' && o.tipo_cambio?.trim()) q.set('tipo_cambio', o.tipo_cambio.trim())
+  return q.toString()
+}
+export function validarTcManual(o: OpcionesMoneda): string | null {
+  if (o.tc_fuente !== 'manual') return null
+  const v = (o.tipo_cambio ?? '').trim()
+  if (!v) return 'Escribe el tipo de cambio.'
+  if (!/^\d{1,6}(\.\d{1,6})?$/.test(v) || Number(v) <= 0) return 'Tipo de cambio inválido: mayor que 0 y hasta 6 decimales.'
+  return null
+}
+const conQuery = (path: string, q: string) => q ? `${path}?${q}` : path
+export const prepararFactura = (org: string, invoiceId: string, o: OpcionesMoneda = {}) =>
+  read<Preparado>(org, conQuery(`cfdi/preparar/${encodeURIComponent(invoiceId)}`, opcionesQuery(o)), d => isObj(d) && Array.isArray(d.bloqueantes))
+export const prepararComplemento = (org: string, paymentId: string, o: OpcionesMoneda = {}) =>
+  read<Preparado>(org, conQuery(`cfdi/complemento/preparar/${encodeURIComponent(paymentId)}`, opcionesQuery(o, { conMoneda: false })), d => isObj(d) && Array.isArray(d.bloqueantes))
+export const borradorPath = (invoiceId: string, o: OpcionesMoneda = {}) => conQuery(`cfdi/preparar/${encodeURIComponent(invoiceId)}/borrador`, opcionesQuery(o))
+export const getCancelable = (org: string, id: number, motivo?: string, sustituto?: string) => {
+  const q = new URLSearchParams()
+  if (motivo) q.set('motivo', motivo)
+  if (motivo === '01' && sustituto && UUID_RE.test(sustituto.trim())) q.set('sustituto', sustituto.trim())
+  return read<Cancelable>(org, conQuery(`cfdi/${id}/cancelable`, q.toString()), d => isObj(d) && typeof d.puede === 'boolean')
+}
 export const getPagos = (org: string) => read<{ cfdi_ppd_vigentes: number; pagos: Pago[] }>(org, 'pagos-por-complementar', d => isObj(d) && Array.isArray(d.pagos))
 export function listaQuery(f: { tipo?: string; estado?: string; origen?: string; invoice_id?: string; invoice_number?: string; payment_id?: string }) {
   const q = new URLSearchParams()
@@ -105,8 +158,18 @@ export async function getCfdis(org: string, f: Parameters<typeof listaQuery>[0] 
 export const getCfdi = (org: string, id: number) => read<Cfdi>(org, `cfdi/${id}`, d => isObj(d) && Number.isInteger(d.id))
 export const getEstatus = (org: string, id: number) => read<{ registro?: Cfdi; api?: Record<string, unknown> }>(org, `cfdi/${id}/estatus`, isObj)
 
-export const timbrarFactura = (org: string, invoiceId: string) => write<Trabajo>(org, 'cfdi/timbrar', { invoice_id: invoiceId, confirmar: true }, esTrabajo)
-export const timbrarComplemento = (org: string, paymentId: string) => write<Trabajo>(org, 'cfdi/complemento', { payment_id: paymentId, confirmar: true }, esTrabajo)
+function cuerpoMoneda(o: OpcionesMoneda, confirmarTc: boolean, conMoneda: boolean) {
+  const b: Record<string, unknown> = {}
+  if (conMoneda && o.moneda) b.moneda = o.moneda
+  if (o.tc_fuente) b.tc_fuente = o.tc_fuente
+  if (o.tc_fuente === 'manual' && o.tipo_cambio?.trim()) b.tipo_cambio = o.tipo_cambio.trim()
+  if (confirmarTc) b.confirmar_tipo_cambio = true
+  return b
+}
+export const timbrarFactura = (org: string, invoiceId: string, o: OpcionesMoneda = {}, confirmarTc = false) =>
+  write<Trabajo>(org, 'cfdi/timbrar', { invoice_id: invoiceId, confirmar: true, ...cuerpoMoneda(o, confirmarTc, true) }, esTrabajo)
+export const timbrarComplemento = (org: string, paymentId: string, o: OpcionesMoneda = {}, confirmarTc = false) =>
+  write<Trabajo>(org, 'cfdi/complemento', { payment_id: paymentId, confirmar: true, ...cuerpoMoneda(o, confirmarTc, false) }, esTrabajo)
 export const cancelarCfdi = (org: string, id: number, motivo: string, sustituto?: string) =>
   write<{ registro?: Cfdi; api?: Record<string, unknown>; en_proceso?: boolean; mensaje?: string }>(org, `cfdi/${id}/cancelar`, { motivo, ...(motivo === '01' ? { sustituto } : {}), confirmar: true }, isObj)
 
@@ -148,8 +211,15 @@ export function abrirEnVentana(win: Window | null, blob: Blob, nombre: string) {
   else descargarBlob(blob, nombre)
   setTimeout(() => URL.revokeObjectURL(href), 5 * 60000)
 }
-export const nombreArchivo = (c: Pick<Cfdi, 'serie' | 'folio' | 'uuid' | 'id'>, archivo: 'xml' | 'pdf' | 'acuse') =>
-  `${[c.serie, c.folio].filter(Boolean).join('-') || 'CFDI-' + c.id}${archivo === 'acuse' ? '-acuse-cancelacion' : ''}.${archivo === 'xml' ? 'xml' : 'pdf'}`
+export type ArchivoCfdi = 'xml' | 'pdf' | 'pdf_original' | 'acuse' | 'acuse_xml'
+export const archivoPath = (id: number, a: ArchivoCfdi) =>
+  a === 'pdf_original' ? `cfdi/${id}/pdf?original=1` : a === 'acuse_xml' ? `cfdi/${id}/acuse?formato=xml` : `cfdi/${id}/${a}`
+export const nombreArchivo = (c: Pick<Cfdi, 'serie' | 'folio' | 'uuid' | 'id'> & { pdf?: Cfdi['pdf'] }, archivo: ArchivoCfdi) => {
+  const base = [c.serie, c.folio].filter(Boolean).join('-') || 'CFDI-' + c.id
+  const sufijo = archivo === 'acuse' || archivo === 'acuse_xml' ? '-acuse-cancelacion' : archivo === 'pdf_original' ? '-original'
+    : archivo === 'pdf' && c.pdf?.leyenda === 'cancelado' ? '_CANCELADO' : archivo === 'pdf' && c.pdf?.leyenda === 'en_proceso' ? '_EN_CANCELACION' : ''
+  return `${base}${sufijo}.${archivo === 'xml' || archivo === 'acuse_xml' ? 'xml' : 'pdf'}`
+}
 
 // ── Presentación ──
 export const ESTADO_LABEL: Record<Estado, string> = {
@@ -189,4 +259,15 @@ export const coincide = (texto: string, ...campos: (string | number | null | und
   if (!words.length) return true
   const hay = norm(campos.filter(v => v !== null && v !== undefined).join(' '))
   return words.every(w => hay.includes(w))
+}
+
+export const RESULTADO_LABEL: Record<string, string> = {
+  en_proceso: 'Cancelación en proceso', sin_aceptacion: 'Cancelado sin aceptación', aceptada: 'Cancelación aceptada por el receptor',
+  plazo_vencido: 'Cancelado por plazo vencido', rechazada: 'El receptor rechazó la cancelación',
+}
+export const FUENTE_TC_LABEL: Record<FuenteTc, string> = { books: 'El de Books', banxico: 'FIX de Banxico', manual: 'Manual' }
+export function formatFechaHora(iso?: string | null) {
+  if (!iso) return '—'
+  const d = new Date(iso)
+  return Number.isNaN(d.getTime()) ? iso : d.toLocaleString('es-MX', { dateStyle: 'short', timeStyle: 'short' })
 }
